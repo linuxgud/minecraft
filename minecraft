@@ -1,0 +1,249 @@
+#!/bin/bash
+# /etc/init.d/minecraft
+# version 0.0.1 2015-06-01 (YYYY-MM-DD)
+
+### BEGIN INIT INFO
+# Provides:   minecraft
+# Required-Start: $local_fs $remote_fs
+# Required-Stop:  $local_fs $remote_fs
+# Should-Start:   $network
+# Should-Stop:    $network
+# Default-Start:  2 3 4 5
+# Default-Stop:   0 1 6
+# Short-Description:    Minecraft server
+# Description:    Starts the minecraft server
+### END INIT INFO
+
+#Settings
+MCPATH='/srv/minecraft'
+SERVERS=' '
+for t in $MCPATH/* ; do SERVERS="$SERVERS $(echo ${t##*/})"; done; SERVERS="$SERVERS "
+
+if [[ $# > 1 && $SERVERS =~ " $2 " ]]; then
+        SERVERS=$2
+fi
+
+
+SERVICE='minecraft_server.jar'
+OPTIONS='nogui'
+USERNAME=''
+WORLD='world'
+BACKUPPATH='/srv/backup/minecraft'
+MAXHEAP=1024
+MINHEAP=1024
+HISTORY=1024
+CPU_COUNT=1
+# INVOCATION="java -Xmx${MAXHEAP}M -Xms${MINHEAP}M -XX:+UseConcMarkSweepGC -XX:+CMSIncrementalPacing -XX:ParallelGCThreads=$CPU_COUNT -XX:+AggressiveOpts -jar $SERVICE $OPTIONS"
+INVOCATION="java -Xmx${MAXHEAP}M -Xms${MINHEAP}M -jar $SERVICE $OPTIONS"
+ME=`whoami`
+
+as_user() {
+  if [ $ME == $USERNAME ] ; then
+    bash -c "$1"
+  else
+    su - $USERNAME -c "$1"
+  fi
+}
+
+mc_start() {
+        USERNAME=$1
+        if pgrep -u $USERNAME -f $SERVICE > /dev/null
+        then
+                echo "$USERNAME $SERVICE is already running!"
+        else
+                echo "Starting $USERNAME $SERVICE..."
+                cd $MCPATH/$USERNAME
+                as_user "cd $MCPATH/$USERNAME && screen -h $HISTORY -dmS $USERNAME $INVOCATION"
+                sleep 7
+                if pgrep -u $USERNAME -f $SERVICE > /dev/null
+                        then
+                                echo "$USERNAME $SERVICE is now running."
+                        else
+                                echo "Error! Could not start $USERNAME $SERVICE!"
+                        fi
+                fi
+}
+
+mc_saveoff() {
+        USERNAME=$1
+        if pgrep -u $USERNAME -f $SERVICE > /dev/null
+        then
+                echo "$USERNAME $SERVICE is running... suspending saves"
+                as_user "screen -p 0 -S $USERNAME -X eval 'stuff \"say SERVER BACKUP STARTING. Server going readonly...\"\015'"
+                as_user "screen -p 0 -S $USERNAME -X eval 'stuff \"save-off\"\015'"
+                as_user "screen -p 0 -S $USERNAME -X eval 'stuff \"save-all\"\015'"
+                sync
+                sleep 10
+        else
+                echo "$USERNAME $SERVICE is not running. Not suspending saves."
+        fi
+}
+
+mc_saveon() {
+        USERNAME=$1
+        if pgrep -u $USERNAME -f $SERVICE > /dev/null
+        then
+                echo "$USERNAME $SERVICE is running... re-enabling saves"
+                as_user "screen -p 0 -S $USERNAME -X eval 'stuff \"save-on\"\015'"
+                as_user "screen -p 0 -S $USERNAME -X eval 'stuff \"say SERVER BACKUP ENDED. Server going read-write...\"\015'"
+        else
+    echo "$SERVICE is not running. Not resuming saves."
+  fi
+}
+
+mc_stop() {
+        USERNAME=$1
+        if pgrep -u $USERNAME -f $SERVICE > /dev/null
+        then
+                echo "Stopping $USERNAME $SERVICE"
+                as_user "screen -p 0 -S $USERNAME -X eval 'stuff \"say SERVER SHUTTING DOWN IN 10 SECONDS. Saving map...\"\015'"
+                as_user "screen -p 0 -S $USERNAME -X eval 'stuff \"save-all\"\015'"
+                sleep 10
+                as_user "screen -p 0 -S $USERNAME -X eval 'stuff \"stop\"\015'"
+                sleep 7
+        else
+                echo "$USERNAME $SERVICE was not running."
+        fi
+        if pgrep -u $USERNAME -f $SERVICE > /dev/null
+        then
+                echo "Error! $USERNAME $SERVICE could not be stopped."
+        else
+                echo "$USERNAME $SERVICE is stopped."
+        fi
+}
+
+mc_update() {
+        USERNAME=$1
+        if pgrep -u $USERNAME -f $SERVICE > /dev/null
+        then
+                echo "$USERNAME $SERVICE is running! Will not start update."
+                return 1
+        fi
+        VER_ONLINE=`curl -m 2 -s https://s3.amazonaws.com/Minecraft.Download/versions/versions.json | jsawk -n 'out(this.latest.release)' 2> /dev/null`
+        VER_LOCAL=$(cat $MCPATH/$USERNAME/version.txt 2> /dev/null)
+        if echo $VER_ONLINE | egrep '^[0-9]+\.[0-9]+(\.[0-9]+|$)' > /dev/null
+        then
+                echo "Current online version of Minecraft is: $VER_ONLINE"
+        else
+                echo "Could not get current online version of Minecraft."
+                return 1
+        fi
+
+        if echo $VER_LOCAL | egrep '^[0-9]+\.[0-9]+(\.[0-9]+|$)' > /dev/null
+        then
+                echo "Current local version of Minecraft is: $VER_LOCAL"
+        else
+                echo "Could not get current local version of Minecraft."
+                echo "Just create $MCPATH/$USERNAME/version.txt with your version."
+                return 1
+        fi
+        if [[ $VER_LOCAL == $VER_ONLINE ]]
+        then
+                echo "Latest verision of Minecraft allredy installed."
+                return 1
+        fi
+        MC_SERVER_URL="https://s3.amazonaws.com/Minecraft.Download/versions/$VER_ONLINE/minecraft_server.$VER_ONLINE.jar"
+        as_user "cd $MCPATH/$USERNAME && wget -q -O $MCPATH/$USERNAME/minecraft_server.jar.update $MC_SERVER_URL"
+        if [ -f $MCPATH/$USERNAME/minecraft_server.jar.update ]
+        then
+                if `diff $MCPATH/$USERNAME/$SERVICE $MCPATH/$USERNAME/minecraft_server.jar.update >/dev/null`
+                then
+                        echo "You are already running the latest version of $SERVICE."
+                else
+                        as_user "mv $MCPATH/$USERNAME/minecraft_server.jar.update $MCPATH/$USERNAME/$SERVICE"
+                        as_user "echo $VER_ONLINE > $MCPATH/$USERNAME/version.txt"
+                        echo "Minecraft successfully updated."
+                fi
+        else
+                echo "Minecraft update could not be downloaded."
+        fi
+}
+
+mc_backup() {
+   mc_saveoff
+
+   NOW=`date "+%Y-%m-%d_%Hh%M"`
+   BACKUP_FILE="$BACKUPPATH/${WORLD}_${NOW}.tar"
+   echo "Backing up minecraft world..."
+   #as_user "cd $MCPATH && cp -r $WORLD $BACKUPPATH/${WORLD}_`date "+%Y.%m.%d_%H.%M"`"
+   as_user "tar -C \"$MCPATH\" -cf \"$BACKUP_FILE\" $WORLD"
+
+   echo "Backing up $SERVICE"
+   as_user "tar -C \"$MCPATH\" -rf \"$BACKUP_FILE\" $SERVICE"
+   #as_user "cp \"$MCPATH/$SERVICE\" \"$BACKUPPATH/minecraft_server_${NOW}.jar\""
+
+   mc_saveon
+
+   echo "Compressing backup..."
+   as_user "gzip -f \"$BACKUP_FILE\""
+   echo "Done."
+}
+
+mc_command() {
+  command="$1";
+  if pgrep -u $USERNAME -f $SERVICE > /dev/null
+  then
+    pre_log_len=`wc -l "$MCPATH/server.log" | awk '{print $1}'`
+    echo "$SERVICE is running... executing command"
+    as_user "screen -p 0 -S minecraft -X eval 'stuff \"$command\"\015'"
+    sleep .1 # assumes that the command will run and print to the log file in less than .1 seconds
+    # print output
+    tail -n $[`wc -l "$MCPATH/server.log" | awk '{print $1}'`-$pre_log_len] "$MCPATH/server.log"
+  fi
+}
+
+#Start-Stop here
+case "$1" in
+        start)
+                for t in $SERVERS
+                do
+                        mc_start $t
+                done
+        ;;
+        stop)
+                for t in $SERVERS
+                do
+                        mc_stop $t
+                done
+        ;;
+        restart)
+                for t in $SERVERS
+                do
+                        mc_stop $t
+                        mc_start $t
+                done
+        ;;
+        update)
+                for t in $SERVERS
+                do
+                        mc_stop $t
+#                       mc_backup $t
+                        mc_update $t
+                        mc_start $t
+                done
+        ;;
+        backup)
+                mc_backup
+        ;;
+        status)
+                if pgrep -u $USERNAME -f $SERVICE > /dev/null
+                then
+                        echo "$SERVICE is running."
+                else
+                        echo "$SERVICE is not running."
+                fi
+        ;;
+        command)
+                if [ $# -gt 1 ]; then
+                        shift
+                        mc_command "$*"
+                else
+                        echo "Must specify server command (try 'help'?)"
+                fi
+        ;;
+        *)
+                echo "Usage: $0 {start|stop|update|backup|status|restart|command \"server command\"}"
+                exit 1
+        ;;
+esac
+exit 0
